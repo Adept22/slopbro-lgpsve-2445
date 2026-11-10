@@ -1,5 +1,7 @@
 # SlopBro
 
+For the SSH-assisted LGPSVE-2445 TOCTOU variant and its external `wwwroot` layout, see [LGPSVE-2445.md](LGPSVE-2445.md).
+
 ## Status
 
 > [!IMPORTANT]

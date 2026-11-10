@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import ssl
 import tempfile
@@ -491,3 +492,110 @@ class Python3CleanupTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RaceAssetTests(unittest.TestCase):
+    def test_directory_edition_has_real_race_assets_and_no_embedded_payloads(self):
+        root = slopbro.resolve_wwwroot_path()
+        self.assertEqual(slopbro.EMBEDDED_WWWROOT, {})
+        for rel_path in slopbro.RACE_REQUIRED_FILES:
+            with self.subTest(path=rel_path):
+                self.assertTrue(
+                    os.path.isfile(os.path.join(root, rel_path)), rel_path
+                )
+        slopbro.require_race_assets()
+
+    def test_missing_external_race_asset_is_fatal(self):
+        with tempfile.TemporaryDirectory() as root:
+            with patch.object(slopbro, "resolve_wwwroot_path", return_value=root):
+                with self.assertRaises(slopbro.RaceError) as caught:
+                    slopbro.require_race_assets()
+        self.assertIn("external wwwroot files", str(caught.exception))
+        self.assertIn("race.html", str(caught.exception))
+
+    def test_root_payload_is_expanded_from_external_valid_template(self):
+        base = '/tmp/race-"quoted"-\\path'
+        wrapper = base + "/run-autoroot.sh"
+        payload = slopbro.make_race_root_payload(base, wrapper)
+        self.assertNotIn("__SLOPBRO_", payload)
+        self.assertIn('var BASE = ' + json.dumps(base) + ";", payload)
+        self.assertIn(
+            'var WRAPPER = ' + json.dumps(wrapper) + ";",
+            payload,
+        )
+
+    def test_race_http_page_uses_filesystem_not_embedded_assets(self):
+        handler_class = slopbro.make_race_http_handler(slopbro.RaceState())
+        handler = object.__new__(handler_class)
+        handler.path = "/race.html?attempts=10"
+        handler.wfile = io.BytesIO()
+        handler.statuses = []
+        handler.headers = []
+        handler.send_response = lambda status, *args: handler.statuses.append(status)
+        handler.send_header = lambda name, value: handler.headers.append((name, value))
+        handler.end_headers = lambda: None
+
+        with patch.object(
+            slopbro, "_read_filesystem_file", return_value=b"external-race-page"
+        ) as disk_read:
+            with patch.object(
+                slopbro,
+                "_read_embedded_file",
+                side_effect=AssertionError("embedded asset used"),
+            ):
+                handler.do_GET()
+
+        self.assertEqual(handler.statuses, [200])
+        self.assertEqual(handler.wfile.getvalue(), b"external-race-page")
+        disk_read.assert_called_once_with(slopbro.resolve_wwwroot_path(), "race.html")
+
+
+class RaceCommandLineTests(unittest.TestCase):
+    def test_race_options_are_forwarded(self):
+        with patch.object(slopbro, "run_race") as runner:
+            self.assertEqual(slopbro.main([
+                "--race-lgpsve2445",
+                "--webos-version=7",
+                "--race-attempts=1200",
+                "--race-batches=2",
+                "--race-timeout=90",
+                "--autoroot-timeout=240",
+                "--race-ssh-key=/tmp/key",
+                "--race-ssh-option=StrictHostKeyChecking=accept-new",
+                "--race-keep-files",
+                "--debug",
+                "tv.local",
+            ]), 0)
+        runner.assert_called_once_with(
+            "tv.local",
+            debug=True,
+            local_ip_override=None,
+            webos_version_override="7",
+            curl_insecure=False,
+            attempts=1200,
+            batches=2,
+            race_timeout=90,
+            autoroot_timeout=240,
+            ssh_user="prisoner",
+            ssh_port=9922,
+            ssh_key="/tmp/key",
+            ssh_options=["StrictHostKeyChecking=accept-new"],
+            trusted=slopbro.RACE_DEFAULT_TRUSTED,
+            race_app_id=None,
+            hbchannel_ipk=None,
+            keep_files=True,
+        )
+
+    def test_race_rejects_test_server_and_nonpositive_values(self):
+        invalid = [
+            ["--race-lgpsve2445", "--test-server=simple", "tv.local"],
+            ["--race-lgpsve2445", "--race-attempts=0", "tv.local"],
+            ["--race-lgpsve2445", "--race-batches=0", "tv.local"],
+            ["--race-lgpsve2445", "--race-timeout=0", "tv.local"],
+            ["--race-lgpsve2445", "--autoroot-timeout=0", "tv.local"],
+        ]
+        for argv in invalid:
+            with self.subTest(argv=argv):
+                with patch("sys.stderr", new_callable=io.StringIO):
+                    with self.assertRaises(SystemExit) as caught:
+                        slopbro.main(argv)
+                self.assertEqual(caught.exception.code, 2)

