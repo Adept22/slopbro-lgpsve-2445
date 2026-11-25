@@ -1491,20 +1491,36 @@ echo $? >%s
             )
         self.ssh.run(command)
 
-    def wait_until_ready(self, timeout=60):
+    def wait_until_ready(self, timeout=120):
         deadline = time.time() + timeout
+        last_k3u = "k3u%d" % (self.attempts - 1)
         while time.time() < deadline:
-            if self.ssh.exists(self.ready_file):
-                first = self.ssh.exists(self.base + "/k3u0")
-                last = self.ssh.exists(self.base + "/k3u%d" % (self.attempts - 1))
-                if first and last:
-                    log("flipper is ready; all unique symlinks were created")
-                    return
-            if self.ssh.exists(self.base + "/helper.error"):
+            proc = self.ssh.run(
+                "if [ -f %s ]; then "
+                "  if [ -L %s ] && [ -L %s ]; then echo READY; "
+                "  else echo PARTIAL; fi; "
+                "elif [ -f %s ]; then echo ERROR; "
+                "elif ! kill -0 $(cat %s 2>/dev/null) 2>/dev/null && [ -f %s ]; then echo DEAD; "
+                "else echo WAIT; fi"
+                % (
+                    _shq(self.ready_file),
+                    _shq(self.base + "/k3u0"),
+                    _shq(self.base + "/" + last_k3u),
+                    _shq(self.base + "/helper.error"),
+                    _shq(self.pid_file),
+                    _shq(self.pid_file),
+                ),
+                check=False,
+            )
+            result = proc.stdout.decode("ascii", "ignore").strip()
+            if result == "READY":
+                log("flipper is ready; all unique symlinks were created")
+                return
+            if result == "ERROR":
                 raise RaceError("flipper failed:\n" + self.log_tail("helper.log"))
-            if not self.ssh.pid_alive(self.pid_file):
+            if result == "DEAD":
                 raise RaceError("flipper exited before readiness:\n" + self.log_tail("helper.log"))
-            time.sleep(0.35)
+            time.sleep(1.5)
         raise RaceError("timed out waiting for flipper readiness:\n" + self.log_tail("helper.log"))
 
     def rooted(self):
@@ -1575,8 +1591,9 @@ def run_race(
     if attempts < 1 or batches < 1:
         raise RaceError("attempts and batches must be positive")
     require_race_assets()
-    if not trusted.startswith("/usr/palm/services/"):
-        raise RaceError("trusted service must be below /usr/palm/services/")
+    _TRUSTED_PREFIXES = ("/usr/palm/services/", "/media/cryptofs/apps/usr/palm/services/")
+    if not any(trusted.startswith(p) for p in _TRUSTED_PREFIXES):
+        raise RaceError("trusted service must be below a known service prefix")
 
     ssh = SSHRunner(host, ssh_user, ssh_port, ssh_key, ssh_options)
     ssh.run("printf 'ssh-ok'")
